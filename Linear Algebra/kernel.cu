@@ -10,6 +10,7 @@
 #include <tuple>
 #include <string>
 #include <functional>
+#include <cstdarg>
 
 //template<typename T>
 //concept Number = std::is_arithmetic<T>::value;
@@ -29,14 +30,14 @@ struct Matrix {
 
     /*
     * Constructs an empty Matrix
-    * 
+    *
     * @tparam N type of the values of the Matrix
     */
     __host__ Matrix<N>() {}
 
     /*
     * Constructs a 1x1 Matrix with value val
-    * 
+    *
     * @param val Value of the primitive in the Matrix
     */
     __host__ Matrix<N>(N val)
@@ -48,12 +49,12 @@ struct Matrix {
 
     /*
     * Constructs an r by c Matrix and allocates space for the backing pointer arr
-    * 
+    *
     * @tparam N type of the values of the Matrix
     * @param r # of rows
     * @param c # of columns
     */
-    __host__ Matrix<N>(unsigned r, unsigned c) 
+    __host__ Matrix<N>(unsigned r, unsigned c)
     {
         this->r = r;
         this->c = c;
@@ -62,9 +63,9 @@ struct Matrix {
 
     /*
     * Constructs an r by c Matrix with a given backing pointer that should be in row major form arr[i][j] = arr[i * c + j]
-    * 
+    *
     * @param r # of rows
-    * @param c # of cols
+    * @param c # of columns
     * @param arr given pointer of values to initalize the Matrix with
     */
     __host__ Matrix<N>(unsigned r, unsigned c, N* arr)
@@ -72,6 +73,35 @@ struct Matrix {
         this->r = r;
         this->c = c;
         this->arr = arr;
+    }
+
+    /*
+    * Contrsucts an r by c Matrix using a given list of numbers to simplify the process.
+    * Here's an example of this for creating a 3 by 2 matrix with elements:
+    * [ 5 10]
+    * [15 20]
+    * [ 3 7]
+    * 
+    * struct Matrix<int> mat = {3, 2, 6, 5, 10, 15, 20, 3, 7}
+    * 
+    * @param r # of rows
+    * @param c # of columns
+    * @param num # of elements you want to add following this parameter
+    * @param ... List of elements you want to add formatted such that a_{1}, a_{2}, ... , a_{num}
+    */
+    __host__ Matrix<N>(unsigned r, unsigned c, int num, ...)
+    {
+        this->r = r;
+        this->c = c;
+        arr = new N[r * c];
+
+        std::va_list valist;
+        va_start(valist, num);
+        for (int i = 0; i < num && i < r * c; i++)
+        {
+            arr[i] = va_arg(valist, N);
+        }
+        va_end(valist);
     }
 
     __host__ Matrix(const Matrix& mat) 
@@ -102,11 +132,11 @@ struct Matrix {
     }
 
     /*
-    * Access value in the Matrix at point (i,j)
+    * Access value in the Matrix at point [i][j]
     * 
     * @param i row i
     * @param j column j
-    * @return Value at index (i,j)
+    * @return Value at index [i][j]
     */
     __host__ __device__ inline N& operator()(int i, int j) 
     {
@@ -158,6 +188,41 @@ struct Matrix {
         }
     }
 };
+
+/*
+* Calculates how many threads per block and the dimension such that: # of threads >= rows * cols
+* 
+* @param dimBlock Given cuda block to modify. Represents the threads per block
+* @param dimGrid Given cuda grid to modify. Represents the amount of blocks
+* @param Number of rows you want to base the calculation off
+* @param Number of columns you want to base the calculation off
+*/
+__host__ void threadCalc(dim3& dimBlock, dim3& dimGrid, unsigned rows, unsigned cols)
+{
+    if (rows > 32 && cols > 32)
+    {
+        dimBlock.x = 32;
+        dimBlock.y = 32;
+    }
+    else if (rows <= 32 && cols <= 32)
+    {
+        dimBlock.y = (unsigned int)pow(2, floor(log2(rows)));
+        dimBlock.x = (unsigned int)pow(2, floor(log2(cols)));
+    }
+    else if (rows < 32)
+    {
+        dimBlock.y = (unsigned int)pow(2, floor(log2(rows)));
+        dimBlock.x = cols > 32 * (32 / dimBlock.y) ? 32 * (32 / dimBlock.y) : (unsigned int)pow(2, floor(log2(cols)));
+    }
+    else // cols < 32
+    {
+        dimBlock.x = (unsigned int)pow(2, floor(log2(cols)));
+        dimBlock.y = rows > 32 * (32 / dimBlock.x) ? 32 * (32 / dimBlock.x) : (unsigned int)pow(2, floor(log2(rows)));
+    }
+
+    dimGrid.x = (cols / dimBlock.x) * dimBlock.x == cols ? cols / dimBlock.x :  cols / dimBlock.x + 1;
+    dimGrid.y = (rows / dimBlock.y) * dimBlock.y == rows ? rows / dimBlock.y :  rows / dimBlock.y + 1;
+}
 
 /*
 * Creates a matrix containing doubles from [0,1)
@@ -215,6 +280,92 @@ __host__ Matrix<double> randomMatrix(unsigned int rows, unsigned int cols)
     return mat;
 }
 
+template <typename N>
+__global__ void transposeK(Matrix<N> A, Matrix<N> B)
+{
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < B.r && j < B.c)
+    {
+        B[i][j] = A[j][i];
+    }
+}
+
+/*
+* Takes the tranpose of a given matrix
+* 
+* @param A The given matrix to take the transpose of
+*/
+template <typename N>
+__host__ Matrix<N> transpose(Matrix<N> A)
+{
+    struct Matrix<N> d_A = A.cudaSetup(true);
+    struct Matrix<N> B = { A.c, A.r };
+    struct Matrix<N> d_B = B.cudaSetup(false);
+
+    dim3 dimBlock;
+    dim3 dimGrid;
+    
+    threadCalc(dimBlock, dimGrid, B.r, B.c);
+
+    transposeK<N> << <dimGrid, dimBlock >> > (d_A, d_B);
+
+    cudaMemcpy(B.arr, d_B.arr, static_cast<unsigned long long>(B.r) * B.c * sizeof(N), cudaMemcpyDeviceToHost);
+
+    cudaFree(d_B.arr);
+    cudaFree(d_A.arr);
+
+    return B;
+}
+
+template <typename N>
+__global__ void kroneckerProductK(Matrix<N> A, Matrix<N> B, Matrix<N> C)
+{
+    //todo Speed this up with shared memory
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i < C.r && j < C.c)
+    {
+        C[i][j] = A[i / A.r][j / A.c] * B[i % B.r][j % B.c];
+    }
+    C(i, j);
+
+}
+
+/*
+* Takes the kronecker product (more often called the tensor product) of two matrices. In the order A x B
+* Note: The kronecker product of two matrices is not commutative!
+* 
+* @param A The first matrix
+* @param B THe second matrix
+*/
+template <typename N>
+__host__ Matrix<N> kroneckerProduct(Matrix<N> A, Matrix<N> B)
+{
+    struct Matrix<N> C = { A.r * B.r, A.c * B.c };
+    size_t size = static_cast<size_t>(C.r) * C.c * sizeof(N);
+
+    struct Matrix<N> d_A = A.cudaSetup(true);
+    struct Matrix<N> d_B = B.cudaSetup(true);
+    struct Matrix<N> d_C = C.cudaSetup(false);
+
+    dim3 dimBlock;
+    dim3 dimGrid;
+
+    threadCalc(dimBlock, dimGrid, C.r, C.c);
+
+    kroneckerProductK << <dimGrid, dimBlock >> > (d_A, d_B, d_C);
+
+    cudaMemcpy(C.arr, d_C.arr, size, cudaMemcpyDeviceToHost);
+
+    cudaFree(d_C.arr);
+    cudaFree(d_B.arr);
+    cudaFree(d_C.arr);
+
+    return C;
+}
+
 //template <Number N>
 template <typename N>
 __global__ void MatAddK(Matrix<N> A, Matrix<N> B, Matrix<N> C)
@@ -228,21 +379,16 @@ __global__ void MatAddK(Matrix<N> A, Matrix<N> B, Matrix<N> C)
     }
 }
 
-template <typename N>
-__host__ Matrix<N> tensorProduct(Matrix<N> A, Matrix<N> B)
-{
-    struct Matrix<N> C = { A.r * B.r, A.c * B.c };
-
-    struct Matrix<N> d_A = A.cudaSetup(true);
-    struct Matrix<N> d_B = B.cudaSetup(true);
-    struct Matrix<N> d_C = C.cudaSetup(false);
-
-    return C;
-}
-
 //template <Number N>
+
+/*
+* Performs standard matrix addition, where each element is added where C_{i,j} = A_{i,j} + B_{i,j}
+* 
+* @param A Matrix
+* @param B Matrix
+*/
 template <typename N>
-__host__ Matrix<N> MatAdd(const Matrix<N> A, const Matrix<N> B)
+__host__ Matrix<N> MatAdd(Matrix<N> A, Matrix<N> B)
 {
     if (A.r != B.r || A.c != B.c)
     {
@@ -252,23 +398,16 @@ __host__ Matrix<N> MatAdd(const Matrix<N> A, const Matrix<N> B)
 
     size_t size = static_cast<unsigned long long>(A.r) * A.c * sizeof(N); //All matrices are the same size
 
-    struct Matrix<N> d_A;
-    d_A.r = A.r; d_A.c = A.c;
-    cudaMalloc(&d_A.arr, size);
-    cudaMemcpy(d_A.arr, A.arr, size, cudaMemcpyHostToDevice);
+    struct Matrix<N> d_A = A.cudaSetup(true);
 
-    struct Matrix<N> d_B;
-    d_B.r = B.r; d_B.c = B.c;
-    cudaMalloc(&d_B.arr, size);
-    cudaMemcpy(d_B.arr, B.arr, size, cudaMemcpyHostToDevice);
+    struct Matrix<N> d_B = B.cudaSetup(true);
 
-    struct Matrix<N> d_C;
-    d_C.r = C.r; d_C.c = C.c;
-    cudaMalloc(&d_C.arr, size);
-    cudaMemcpy(d_C.arr, C.arr, size, cudaMemcpyHostToDevice);    
+    struct Matrix<N> d_C = C.cudaSetup(false);
 
-    dim3 dimBlock(C.r > 512 ? 512 : (unsigned int) pow(2, floor(log2(C.r))), C.c > 512 ? 512 : (unsigned int) pow(2, floor(log2(C.c)) ) );
-    dim3 dimGrid(C.r / dimBlock.x + 1, C.c / dimBlock.y + 1);
+    dim3 dimBlock;
+    dim3 dimGrid;
+
+    threadCalc(dimBlock, dimGrid, C.r, C.c);
 
     MatAddK<N><< <dimGrid, dimBlock >> > (d_A, d_B, d_C);
 
@@ -295,9 +434,24 @@ int main()
 
     mat.print();
 
+    mat += mat;
+    mat.print();
     (randomMatrix(10,10)).print();
     std::cout << '\n';
     (randomMatrix(10, 10)).print();
+    std::cout << '\n';
+    transpose(mat).print();
+    std::cout << "\n\n";
+
+    struct Matrix<int> alpha = { 2, 2 , 4, 0, 5, 6, 7};
+    struct Matrix<int> beta = { 2, 2, 4, 1, 2, 3, 4 };
+
+    beta.print();
+    alpha.print();
+
+    std::cout << "\n\n";
+
+    kroneckerProduct(beta, alpha).print();
 
     return 0;
 }
